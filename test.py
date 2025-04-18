@@ -7,10 +7,10 @@ import time # Added for potential delays if needed
 # --- Configuration ---
 FS = 44100           # Sampling rate (Hz)
 CHIRP_DURATION = 0.01 # Chirp duration (seconds)
-RECORD_DURATION = 1.0 # Total recording duration (seconds)
+RECORD_DURATION = 2.0 # Total recording duration (seconds)
 REPEAT_COUNT = 5      # Number of pings to average
 SPEED_OF_SOUND = 343 # m/s
-MAX_DISTANCE = 5     # meters (max echo range to search)
+MAX_DISTANCE = 15     # meters (max echo range to search)
 LOW_CUT = 18000      # Near-ultrasound bandpass low freq (Hz)
 HIGH_CUT = 22000     # High freq (Hz) (limit of phone/laptop speaker/mic)
 PEAK_THRESHOLD_RATIO = 0.5 # Minimum correlation peak relative to max peak
