@@ -7,98 +7,97 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 import joblib # For saving the trained model
 import warnings
+# Optional: For resizing spectrograms if needed
+# from skimage.transform import resize 
 
 # Suppress specific warnings if needed
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-dataset_dir = "dataset" # Directory where collect.py saves the .npy files
-model_filename = "sonar_classifier.joblib" # Filename to save the trained model
+dataset_dir = "dataset" # Directory where collect.py saves the .npz files
+model_filename = "sonar_spectrogram_classifier.joblib" # Updated model filename
+# Define a fixed size for spectrograms if needed for consistency
+# FIXED_SHAPE = (128, 64) # Example: (frequency_bins, time_bins) - Adjust as needed! Set to None to disable resizing.
+FIXED_SHAPE = None 
 
-def extract_features(distances):
+def extract_features_from_spectrogram(zxx_magnitude):
     """
-    Extracts features from a list or array of sonar distances.
+    Extracts features from a spectrogram magnitude array (Zxx).
     Args:
-        distances (list or np.ndarray): List/array of detected echo distances.
+        zxx_magnitude (np.ndarray): The 2D array representing spectrogram magnitude.
     Returns:
-        list: A list of float features. Returns None if input is invalid.
+        np.ndarray: A 1D feature vector. Returns None if input is invalid.
     """
-    # Ensure input is iterable and convert to numpy array
-    try:
-        if distances is None:
-             distances = np.array([])
-        elif not isinstance(distances, np.ndarray):
-             distances = np.array(distances, dtype=np.float32)
-    except Exception as e:
-        print(f"Warning: Could not convert distances to array: {e}. Input: {distances}")
-        return None # Indicate error
+    if zxx_magnitude is None or not isinstance(zxx_magnitude, np.ndarray) or zxx_magnitude.ndim != 2:
+        print(f"Warning: Invalid input spectrogram data. Type: {type(zxx_magnitude)}, Shape: {getattr(zxx_magnitude, 'shape', 'N/A')}")
+        return None
 
-    # Ensure data is numeric and finite before processing
-    distances = distances[np.isfinite(distances)]
+    # --- Option 1: Flatten the spectrogram (Simple) ---
+    features = zxx_magnitude.flatten()
 
-    if distances.size == 0:
-        # Define features for empty or invalid sonar data
-        return [0.0, 0.0, 0.0, 0.0, 0.0] # Use floats
-    else:
-        distances = np.sort(distances) # Sort valid distances
-        diffs = np.diff(distances) # Calculate differences
-        features = [
-            float(len(distances)),            # Number of detected distances
-            float(np.min(distances)),         # Minimum distance
-            float(np.max(distances)),         # Maximum distance
-            float(np.mean(distances)),        # Mean distance
-            float(np.std(diffs)) if len(diffs) > 0 else 0.0 # Std dev of differences
-        ]
-        return features
+    # Ensure features are finite
+    if not np.all(np.isfinite(features)):
+        print("Warning: Non-finite values found in features. Replacing with 0.")
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        
+    return features
 
 
 def load_dataset():
-    """Loads the dataset from label-specific subdirectories."""
+    """Loads the spectrogram dataset from label-specific subdirectories."""
     x, y = [], []
     print(f"Loading data from subdirectories in: {os.path.abspath(dataset_dir)}")
 
-    # Check if dataset directory exists
     if not os.path.isdir(dataset_dir):
         print(f"Error: Dataset directory '{dataset_dir}' not found.")
         return np.array([]), np.array([])
 
     skipped_files = 0
     processed_files = 0
-    # Iterate through items in the dataset directory
+    first_feature_length = None # To check for consistent feature lengths
+
     for label in os.listdir(dataset_dir):
         label_dir = os.path.join(dataset_dir, label)
-        # Check if it's a directory (representing a class label)
         if os.path.isdir(label_dir):
             print(f"Processing label: {label}")
-            # Find all .npy files within the label directory
-            files_found = glob.glob(os.path.join(label_dir, "*.npy"))
+            # Find all .npz files within the label directory
+            files_found = glob.glob(os.path.join(label_dir, "*.npz")) # Changed to .npz
             if not files_found:
-                print(f"  Warning: No .npy files found for label '{label}'.")
+                print(f"  Warning: No .npz files found for label '{label}'.")
                 continue
 
             for file in files_found:
                 filename = os.path.basename(file)
                 try:
-                    # Load the numpy array of distances
+                    # Load the numpy archive
                     data = np.load(file, allow_pickle=True)
 
-                    # Basic check if data looks like a list/array of numbers
-                    if not isinstance(data, np.ndarray) or data.ndim != 1:
-                         if isinstance(data, list): data = np.array(data, dtype=np.float32)
-                         else:
-                             print(f"  Warning: Skipping file - expected 1D array/list, got {type(data)} in {filename}")
-                             skipped_files += 1
-                             continue
+                    # Check if 'Zxx' key exists
+                    if 'Zxx' not in data:
+                        print(f"  Warning: Skipping file - 'Zxx' key not found in {filename}")
+                        skipped_files += 1
+                        continue
+                        
+                    zxx_magnitude = np.abs(data['Zxx']) # Use magnitude
 
-                    features = extract_features(data) # Pass the loaded distances array
+                    features = extract_features_from_spectrogram(zxx_magnitude)
 
                     if features is None:
                         print(f"  Warning: Skipping file due to feature extraction error: {filename}")
                         skipped_files += 1
                         continue
+                        
+                    # Check for consistent feature vector length if not resizing
+                    if FIXED_SHAPE is None:
+                        if first_feature_length is None:
+                            first_feature_length = len(features)
+                        elif len(features) != first_feature_length:
+                            print(f"  Warning: Skipping file - inconsistent feature length ({len(features)} vs {first_feature_length}). Consider resizing (FIXED_SHAPE). File: {filename}")
+                            skipped_files += 1
+                            continue
 
                     x.append(features)
-                    y.append(label) # Use the directory name as the label
+                    y.append(label)
                     processed_files += 1
 
                 except Exception as e:
@@ -109,19 +108,20 @@ def load_dataset():
 
 
     print(f"\nSuccessfully processed {processed_files} files, skipped {skipped_files} files.")
-    if not x: # Check if list is empty after processing files
+    if not x:
          print("Error: No valid data loaded from files.")
          return np.array([]), np.array([])
 
-    # Ensure features are floats for model training consistency
+    # Ensure features are floats
     return np.array(x, dtype=np.float32), np.array(y)
 
-
+# --- train_model function remains largely the same ---
+# It will now receive the features extracted from spectrograms
 def train_model():
     """Loads data, trains the model, evaluates, and saves it."""
     X, y = load_dataset()
 
-    if X.size == 0 or y.size == 0: # Check if arrays are empty
+    if X.size == 0 or y.size == 0:
         print("No data loaded. Cannot train model.")
         return None
 

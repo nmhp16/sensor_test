@@ -2,8 +2,11 @@ import sounddevice as sd
 import numpy as np
 import time
 import os
-from scipy.signal import correlate, butter, filtfilt, windows, chirp, find_peaks
+from scipy.signal import butter, filtfilt, windows, chirp, stft
 import warnings
+import matplotlib.pyplot as plt
+import json
+import sys
 
 # Suppress specific warnings if needed
 warnings.filterwarnings("ignore", category=UserWarning) # Example: Suppress SoundDevice warnings if needed
@@ -20,6 +23,9 @@ HIGHCUT = 22000 # High frequency (Hz) (limit of phone/laptop speaker/mic)
 PEAK_THRESHOLD_RATIO = 0.1 # Relative threshold for peak detection (adjust based on noise)
 MIN_PEAK_DISTANCE_SEC = 0.01 # Minimum time separation between peaks (avoid multiple detections of same echo)
 DATASET_DIR = "dataset" # Directory to save echo data
+MIN_VALID_DISTANCE = 0.5  # Minimum distance (in meters) to consider as valid echo
+DEBUG_VISUALIZATION = True # <--- CHANGE THIS TO True
+CALIBRATION_FILE = "calibration.json"
 
 # --- Create chirp ---
 t = np.linspace(0, CHIRP_TIME, int(FS * CHIRP_TIME), endpoint=False) # Time vector
@@ -51,147 +57,94 @@ def bandpass_filter(data, lowcut, highcut, fs, order=5):
         print(f"Error applying filter: {e}")
         return data # Return unfiltered data on error
 
-def detect_echoes():
-    """Plays chirp, records, processes, and returns detected distances."""
-    all_distances = []
-    min_peak_distance_samples = int(MIN_PEAK_DISTANCE_SEC * FS)
+def analyze_spectrogram():
+    """Plays chirp, records, and displays the spectrogram of the received signal."""
+    print(f"Starting {REPEAT} pings for spectrogram analysis...")
+    
+    # STFT parameters (tune these)
+    nperseg = 256  # Length of each segment (window size)
+    noverlap = nperseg // 2 # Amount of overlap between segments
+    nfft = 512 # Length of FFT used, if different from nperseg
 
-    # Calculate max delay samples based on MAX_DISTANCE
-    max_delay_samples = int(FS * (2 * MAX_DISTANCE / SPEED_OF_SOUND))
-    # Ensure recording duration is sufficient
-    required_record_samples = len(ping) + max_delay_samples
-    if len(play_signal) < required_record_samples:
-         print(f"Warning: Recording duration ({DURATION}s) might be too short for MAX_DISTANCE ({MAX_DISTANCE}m).")
-         print(f"         Need at least {required_record_samples/FS:.2f}s.")
-
-
-    print(f"Starting {REPEAT} pings...")
     for i in range(REPEAT):
         try:
-            # Play the chirp signal and record the response
-            # Use blocking=True to ensure recording completes before processing
             rec = sd.playrec(play_signal, samplerate=FS, channels=1, blocking=True)
-            # sd.wait() # Not needed if blocking=True
 
             if rec is None or len(rec) == 0:
                 print(f"Ping {i+1}/{REPEAT}: Recording failed.")
                 continue
 
-            rec = rec.flatten() # Flatten the recorded signal
+            rec = rec.flatten()
 
-            # --- Signal Processing ---
-            filtered = bandpass_filter(rec, LOWCUT, HIGHCUT, FS) # Filter the recorded signal
+            # --- Signal Processing (Optional but recommended) ---
+            filtered_rec = bandpass_filter(rec, LOWCUT, HIGHCUT, FS)
 
-            # Cross-correlation
-            # Use 'valid' mode if ping is shorter than filtered signal, adjust search window start
-            # Using 'full' is okay if we slice correctly
-            corr = correlate(filtered, ping, mode='full', method='fft') # Use FFT for speed
+            # --- Spectrogram Calculation ---
+            f, t_spec, Zxx = stft(filtered_rec, fs=FS, window='hann',
+                                  nperseg=nperseg, noverlap=noverlap, nfft=nfft)
 
-            # Calculate the relevant part of the correlation output
-            # The peak corresponding to the direct sound path (or very close reflection)
-            # should occur near the length of the recording minus the length of the ping.
-            # However, finding the *start* lag is simpler with 'full' mode.
-            # Lag 0 corresponds to index len(filtered) - 1 in the 'full' output.
-            # We search *after* the direct signal transmission.
-            start_search_index = len(ping) - 1 # Index corresponding roughly to lag 0
-            end_search_index = start_search_index + max_delay_samples
-            # Ensure end index is within bounds
-            end_search_index = min(end_search_index, len(corr))
-
-            if start_search_index >= end_search_index:
-                 print(f"Ping {i+1}/{REPEAT}: Invalid search window indices.")
-                 continue
-
-            search_corr = corr[start_search_index:end_search_index] # Search window for echoes
-
-            if len(search_corr) == 0:
-                 print(f"Ping {i+1}/{REPEAT}: Correlation search window is empty.")
-                 continue
-
-            # --- Peak Finding ---
-            max_corr_val = np.max(search_corr)
-            if max_corr_val <= 0: # Avoid issues if correlation is all non-positive
-                 print(f"Ping {i+1}/{REPEAT}: No positive correlation found.")
-                 continue
-
-            peak_height_threshold = PEAK_THRESHOLD_RATIO * max_corr_val
-
-            # Find peaks in the correlation search window
-            peaks_relative_indices, props = find_peaks(
-                search_corr,
-                height=peak_height_threshold,
-                distance=min_peak_distance_samples
-            )
-
-            # Convert relative peak indices back to time delays (samples from start of search)
-            # The index 'p' in peaks_relative_indices corresponds to a delay of 'p' samples *after* the start of the search window.
-            distances = [(SPEED_OF_SOUND * (p / FS)) / 2.0 for p in peaks_relative_indices] # Calculate distances
-
-            if distances:
-                 print(f"Ping {i+1}/{REPEAT}: Found {len(distances)} echoes. Distances: {[f'{d:.2f}m' for d in distances]}")
-                 all_distances.extend(distances) # Add distances from this ping to the list
-
-            else:
-                 print(f"Ping {i+1}/{REPEAT}: No significant echoes detected.")
+            # --- Visualization ---
+            plt.figure(figsize=(12, 6))
+            # Use logarithmic scale for magnitude (dB) for better visibility
+            plt.pcolormesh(t_spec, f, np.abs(Zxx), shading='gouraud', cmap='viridis')
+            # Limit frequency axis to area of interest if desired
+            plt.ylim(LOWCUT * 0.8, HIGHCUT * 1.2)
+            plt.title(f'Spectrogram - Ping {i+1}')
+            plt.ylabel('Frequency [Hz]')
+            plt.xlabel('Time [sec]')
+            plt.colorbar(label='Magnitude')
+            # plt.show() 
+            # print(f"Ping {i+1}/{REPEAT}: Spectrogram displayed.")
+            
+            # --- Return data for saving ---
+            # For simplicity, let's just return the first ping's data for now
+            # A better approach would average or concatenate Zxx across pings
+            if i == 0: 
+                first_ping_data = {'Zxx': Zxx, 't': t_spec, 'f': f}
 
         except sd.PortAudioError as pae:
             print(f"PortAudioError during ping {i+1}: {pae}")
-            print("Check your audio device settings (input/output).")
-            # Optionally break or return early if audio device fails
-            return [] # Return empty list on critical audio error
+            break # Stop if audio device fails
         except Exception as e:
             print(f"Error during ping {i+1}: {e}")
-            # Continue to next ping if possible, or handle error as needed
 
-    print(f"Finished pings. Total echoes found across {REPEAT} pings: {len(all_distances)}")
-    # Return the combined list of distances from all successful pings
-    return all_distances
-
-def save_echo_data(distances, label):
-    """Saves the list of detected distances to a .npy file within a label-specific folder."""
-    if not distances: # Don't save if the list is empty
-        print("No distances to save.")
-        return
-    try:
-        # Sanitize label for folder name
-        safe_label = "".join(c if c.isalnum() else "_" for c in label).strip('_')
-        if not safe_label: safe_label = "unknown"
-
-        # Create the label-specific directory path
-        target_dir = os.path.join(DATASET_DIR, safe_label)
-        os.makedirs(target_dir, exist_ok=True) # Ensure directory exists
-
-        # Use timestamp as the filename within the label folder
-        timestamp = int(time.time())
-        filename = f"{timestamp}.npy"
-        path = os.path.join(target_dir, filename)
-
-        np.save(path, np.array(distances, dtype=np.float32)) # Save as numpy array of floats
-        print(f"Saved: {path}")
-    except Exception as e:
-        print(f"Error saving data: {e}")
+    print("Finished pings.")
+    # This function primarily visualizes; returning data would require processing Zxx
+    # Return the collected data (e.g., from the first ping)
+    # Modify this return logic based on how you want to handle multiple pings
+    return first_ping_data if 'first_ping_data' in locals() else None
 
 # --- Main execution block ---
 if __name__ == "__main__":
-    print("--- Starting Sonar Echo Collection ---")
-    # Ensure sounddevice uses default devices or configure specific ones if needed
-    # print("Available audio devices:", sd.query_devices())
-    # sd.default.device = [input_device_index, output_device_index] # Optional: Set devices
+    print("--- Starting Sonar Spectrogram Analysis & Data Collection ---")
+    
+    spectrogram_data = analyze_spectrogram()
 
-    detected_distances = detect_echoes()
-
-    if detected_distances:
-        print(f"\nFinal combined distances: {[f'{d:.2f}m' for d in detected_distances]}")
+    if spectrogram_data:
         try:
-            # Get label from user
-            label_input = input("Enter label for this data (e.g., wall, person, empty): ").strip()
-            if label_input:
-                save_echo_data(detected_distances, label_input)
+            label = input(f"Enter label for this data (e.g., wall, person, empty) or leave blank to skip saving: ").strip()
+            if label:
+                # Create dataset directory if it doesn't exist
+                if not os.path.exists(DATASET_DIR):
+                    os.makedirs(DATASET_DIR)
+                
+                # Create label subdirectory if it doesn't exist
+                label_dir = os.path.join(DATASET_DIR, label)
+                if not os.path.exists(label_dir):
+                    os.makedirs(label_dir)
+
+                # Generate unique filename (e.g., using timestamp)
+                timestamp = int(time.time())
+                filename = os.path.join(label_dir, f"{timestamp}.npz")
+                
+                # Save the spectrogram data and axes
+                np.savez(filename, Zxx=spectrogram_data['Zxx'], t=spectrogram_data['t'], f=spectrogram_data['f'])
+                print(f"Saved data for label '{label}' to: {filename}")
             else:
                 print("No label entered. Data not saved.")
         except EOFError:
              print("\nInput interrupted. Data not saved.")
     else:
-        print("\nNo echoes detected in any ping.")
+        print("No spectrogram data collected.")
 
     print("\n--- Collection Script Finished ---")
